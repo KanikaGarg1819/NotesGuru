@@ -39,30 +39,24 @@ def convert_to_grayscale(image: np.ndarray) -> np.ndarray:
 def deskew(image: np.ndarray) -> np.ndarray:
     """
     Fix tilt in the image.
-    Detects the angle of text lines and rotates to straighten them.
-    Works best on images with clear horizontal text.
+    Only corrects small angles (under 15 degrees) to avoid over-rotation.
     """
-    # Find all non-zero pixel coordinates
-    coords = np.column_stack(np.where(image < 128))  # dark pixels
+    coords = np.column_stack(np.where(image < 128))
 
     if len(coords) < 100:
-        # Not enough dark pixels to detect angle — return as is
         return image
 
-    # Get the minimum area rectangle around all dark pixels
     angle = cv2.minAreaRect(coords)[-1]
 
-    # Adjust angle to be in range [-45, 45]
     if angle < -45:
         angle = -(90 + angle)
     else:
         angle = -angle
 
-    # Only deskew if tilt is significant (more than 0.5 degrees)
-    if abs(angle) < 0.5:
+    # Only fix small tilts — ignore large angles to avoid over-rotation
+    if abs(angle) > 15 or abs(angle) < 0.5:
         return image
 
-    # Rotate the image to fix the tilt
     (h, w) = image.shape[:2]
     center = (w // 2, h // 2)
     rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -75,7 +69,6 @@ def deskew(image: np.ndarray) -> np.ndarray:
     )
     logger.info(f"Deskewed image by {angle:.2f} degrees")
     return deskewed
-
 
 def denoise(image: np.ndarray) -> np.ndarray:
     """
@@ -123,12 +116,7 @@ def image_to_bytes(image: np.ndarray, format: str = "PNG") -> bytes:
 
 def preprocess_image(image_bytes: bytes) -> dict:
     """
-    Full preprocessing pipeline.
-    
-    Input:  raw image bytes (from upload)
-    Output: dict with cleaned image bytes + metadata
-    
-    Pipeline: load → grayscale → deskew → denoise → contrast → binarize
+    Full preprocessing pipeline — lighter touch for handwriting.
     """
     try:
         # Step 1 — Load
@@ -139,26 +127,32 @@ def preprocess_image(image_bytes: bytes) -> dict:
         # Step 2 — Grayscale
         gray = convert_to_grayscale(image)
 
-        # Step 3 — Deskew
+        # Step 3 — Deskew (small angles only)
         deskewed = deskew(gray)
 
-        # Step 4 — Denoise
-        denoised = denoise(deskewed)
+        # Step 4 — Denoise (lighter)
+        denoised = cv2.fastNlMeansDenoising(deskewed, h=7)
 
-        # Step 5 — Contrast boost
+        # Step 5 — Contrast boost only (skip binarize for handwriting)
         contrasted = boost_contrast(denoised)
 
-        # Step 6 — Binarize
-        binary = binarize(contrasted)
-
         # Convert back to bytes
-        cleaned_bytes = image_to_bytes(binary)
+        cleaned_bytes = image_to_bytes(contrasted)
 
         return {
             "success": True,
             "cleaned_image": cleaned_bytes,
             "original_size": f"{original_shape[1]}x{original_shape[0]}",
             "message": "Image preprocessed successfully",
+        }
+
+    except Exception as e:
+        logger.error(f"Preprocessing error: {e}")
+        return {
+            "success": False,
+            "cleaned_image": None,
+            "original_size": None,
+            "message": str(e),
         }
 
     except ValueError as e:
