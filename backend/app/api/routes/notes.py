@@ -1,5 +1,12 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import Response
+from sqlalchemy.orm import Session
+from app.db.session import get_db
+from app.core.dependencies import get_current_user
+from app.models.user import User
+from app.models.note import Note, NoteStatus
+from app.models.guide import Guide
+from app.models.syllabus import Syllabus, Chapter
 from app.services.image_processor import preprocess_image
 from app.services.ocr_service import extract_text
 from app.tasks.ocr_task import process_note_task
@@ -9,7 +16,6 @@ router = APIRouter()
 
 @router.post("/preprocess-test")
 async def test_preprocessing(file: UploadFile = File(...)):
-    """Phase 3 — Upload image, get back cleaned version."""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
     image_bytes = await file.read()
@@ -25,7 +31,6 @@ async def test_preprocessing(file: UploadFile = File(...)):
 
 @router.post("/ocr-test")
 async def test_ocr(file: UploadFile = File(...)):
-    """Phase 4 — Upload image, get back extracted text."""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
     image_bytes = await file.read()
@@ -34,8 +39,8 @@ async def test_ocr(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=preprocessed["message"])
     ocr_result = extract_text(preprocessed["cleaned_image"])
     return {
-        "success":    ocr_result["success"],
-        "text":       ocr_result["text"],
+        "success": ocr_result["success"],
+        "text": ocr_result["text"],
         "ocr_source": ocr_result["source"],
         "char_count": len(ocr_result["text"]),
     }
@@ -46,46 +51,64 @@ async def process_note(
     file: UploadFile = File(...),
     syllabus_id: int = 1,
     subject: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Phase 7 — Full pipeline as background task.
-    Upload image → get task_id immediately → poll /notes/status/{task_id} for result.
-    """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
 
-    image_bytes = await file.read()
+    # Get chapters from DB if syllabus exists
+    chapters = []
+    syllabus = db.query(Syllabus).filter(
+        Syllabus.id == syllabus_id,
+        Syllabus.owner_id == current_user.id
+    ).first()
 
-    # Convert to hex for Celery serialization
+    if syllabus:
+        db_chapters = db.query(Chapter).filter(Chapter.syllabus_id == syllabus_id).all()
+        chapters = [{"id": c.id, "title": c.title, "description": c.description or ""} for c in db_chapters]
+
+    # Fallback dummy chapters if no syllabus
+    if not chapters:
+        chapters = [
+            {"id": 1, "title": "General Notes", "description": ""},
+            {"id": 2, "title": "Key Concepts", "description": ""},
+            {"id": 3, "title": "Definitions", "description": ""},
+        ]
+
+    image_bytes = await file.read()
     image_hex = image_bytes.hex()
 
-    # Dummy chapters for now — Phase 10 will pull from DB
-    dummy_chapters = [
-        {"id": 1, "title": "General Notes",     "description": ""},
-        {"id": 2, "title": "Key Concepts",       "description": ""},
-        {"id": 3, "title": "Definitions",        "description": ""},
-    ]
-
-    # Queue the task
     task = process_note_task.delay(
         image_bytes_hex=image_hex,
-        chapters=dummy_chapters,
+        chapters=chapters,
         subject=subject,
     )
 
+    # Save note record with pending status
+    note = Note(
+        image_url=f"task:{task.id}",
+        status=NoteStatus.PENDING,
+        owner_id=current_user.id,
+        syllabus_id=syllabus_id,
+    )
+    db.add(note)
+    db.commit()
+
     return {
         "task_id": task.id,
-        "status":  "queued",
+        "note_id": note.id,
+        "status": "queued",
         "message": "Note is being processed. Poll /notes/status/{task_id} for result.",
     }
 
 
 @router.get("/status/{task_id}")
-async def get_task_status(task_id: str):
-    """
-    Phase 7 — Poll this endpoint to check background task progress.
-    Returns current step + result when done.
-    """
+async def get_task_status(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     from app.tasks.worker import celery_app
     task = celery_app.AsyncResult(task_id)
 
@@ -96,28 +119,51 @@ async def get_task_status(task_id: str):
         meta = task.info or {}
         return {
             "task_id": task_id,
-            "status":  "processing",
-            "step":    meta.get("step", ""),
+            "status": "processing",
+            "step": meta.get("step", ""),
             "percent": meta.get("percent", 0),
         }
 
     if task.state == "SUCCESS":
-        return {
-            "task_id": task_id,
-            "status":  "done",
-            "result":  task.result,
-        }
+        result = task.result
+
+        # Save guide to DB if successful
+        if result.get("success"):
+            note = db.query(Note).filter(Note.image_url == f"task:{task_id}").first()
+            if note:
+                note.raw_text = result.get("note_text", "")
+                note.cleaned_text = result.get("note_text", "")
+                note.match_score = result.get("match_score", 0)
+                note.status = NoteStatus.MATCHED if result.get("matched") else NoteStatus.UNMATCHED
+                note.chapter_id = result.get("chapter_id")
+                db.flush()
+
+                # Save guide if not already saved
+                existing = db.query(Guide).filter(Guide.note_id == note.id).first()
+                if not existing and result.get("guide_content"):
+                    guide = Guide(
+                        title=result.get("chapter_title", "Study Guide"),
+                        content=result.get("guide_content", ""),
+                        chapter_name=result.get("chapter_title", ""),
+                        owner_id=current_user.id,
+                        note_id=note.id,
+                    )
+                    db.add(guide)
+
+                db.commit()
+
+        return {"task_id": task_id, "status": "done", "result": result}
 
     if task.state == "FAILURE":
-        return {
-            "task_id": task_id,
-            "status":  "failed",
-            "error":   str(task.info),
-        }
+        return {"task_id": task_id, "status": "failed", "error": str(task.info)}
 
     return {"task_id": task_id, "status": task.state}
 
 
 @router.get("/")
-async def list_notes():
-    return {"notes": [], "message": "Notes endpoint ready"}
+async def list_notes(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    notes = db.query(Note).filter(Note.owner_id == current_user.id).order_by(Note.created_at.desc()).all()
+    return [{"id": n.id, "status": n.status, "match_score": n.match_score, "created_at": n.created_at.isoformat()} for n in notes]
