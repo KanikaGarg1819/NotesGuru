@@ -44,6 +44,7 @@ export default function Dashboard() {
   useEffect(() => {
     if (view === 'guides') loadGuides()
     if (view === 'syllabus') loadSyllabuses()
+    if (view === 'upload') loadSyllabuses()
   }, [view])
 
   async function loadGuides() {
@@ -192,6 +193,18 @@ export default function Dashboard() {
               )}
             </div>
             <div className={styles.subjectRow}>
+              <select
+                className={styles.subjectInput}
+                value={syllabusId}
+                onChange={e => setSyllabusId(Number(e.target.value))}
+              >
+                <option value={0}>No syllabus (general)</option>
+                {syllabuses.map(s => (
+                  <option key={s.id} value={s.id}>{s.title} — {s.subject}</option>
+                ))}
+              </select>
+            </div>
+            <div className={styles.subjectRow}>
               <input className={styles.subjectInput} placeholder="Subject (optional) — e.g. Computer Networks" value={subject} onChange={e => setSubject(e.target.value)} />
             </div>
             <div className={styles.actions}>
@@ -306,12 +319,47 @@ export default function Dashboard() {
             {showNewSyllabus && (
               <div className={styles.newSyllabusForm}>
                 <div className={styles.formRow}>
-                  <input className={styles.subjectInput} placeholder="Syllabus title — e.g. Computer Networks" value={newSyllabus.title} onChange={e => setNewSyllabus(s => ({ ...s, title: e.target.value }))} />
+                  <input className={styles.subjectInput} placeholder="Syllabus title — e.g. Optimization Techniques" value={newSyllabus.title} onChange={e => setNewSyllabus(s => ({ ...s, title: e.target.value }))} />
                 </div>
                 <div className={styles.formRow}>
                   <input className={styles.subjectInput} placeholder="Subject" value={newSyllabus.subject} onChange={e => setNewSyllabus(s => ({ ...s, subject: e.target.value }))} />
                   <input className={styles.subjectInput} placeholder="Semester (optional)" value={newSyllabus.semester} onChange={e => setNewSyllabus(s => ({ ...s, semester: e.target.value }))} />
                 </div>
+                <div className={styles.aiPasteSection}>
+                  <p className={styles.chaptersLabel}>✦ Paste syllabus text — AI splits into topics automatically</p>
+                  <textarea
+                    className={styles.syllabusTextarea}
+                    placeholder="Paste your full syllabus here e.g: Unconstrained Optimization: Gradient Descent, Newton Method. Constrained Optimization: Lagrange Multipliers, KKT Conditions. Dynamic Programming: Principle of Optimality..."
+                    value={newSyllabus.syllabus_text || ''}
+                    onChange={e => setNewSyllabus(s => ({ ...s, syllabus_text: e.target.value }))}
+                    rows={5}
+                  />
+                  <button
+                    className={styles.aiParseBtn}
+                    onClick={async () => {
+                      if (!newSyllabus.title || !newSyllabus.subject || !newSyllabus.syllabus_text) return
+                      setNewSyllabus(s => ({ ...s, parsing: true }))
+                      try {
+                        const res = await fetch(`${API}/syllabus/parse-text`, {
+                          method: 'POST',
+                          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ title: newSyllabus.title, subject: newSyllabus.subject, semester: newSyllabus.semester, syllabus_text: newSyllabus.syllabus_text }),
+                        })
+                        if (res.ok) {
+                          setShowNewSyllabus(false)
+                          setNewSyllabus({ title: '', subject: '', semester: '', chapters: [{ unit_number: 1, title: '', description: '' }] })
+                          loadSyllabuses()
+                        }
+                      } finally {
+                        setNewSyllabus(s => ({ ...s, parsing: false }))
+                      }
+                    }}
+                    disabled={!newSyllabus.title || !newSyllabus.subject || !newSyllabus.syllabus_text || newSyllabus.parsing}
+                  >
+                    {newSyllabus.parsing ? 'Parsing with AI...' : '✦ Parse & create with AI'}
+                  </button>
+                </div>
+                <div className={styles.orDivider}><span>or add chapters manually</span></div>
                 <div className={styles.chaptersSection}>
                   <p className={styles.chaptersLabel}>Chapters</p>
                   {newSyllabus.chapters.map((ch, i) => (
@@ -324,10 +372,11 @@ export default function Dashboard() {
                   <button className={styles.addChapterBtn} onClick={addChapter}>+ Add chapter</button>
                 </div>
                 <div className={styles.actions}>
-                  <button className={styles.processBtn} onClick={createSyllabus} disabled={!newSyllabus.title || !newSyllabus.subject}>Create syllabus</button>
+                  <button className={styles.processBtn} onClick={createSyllabus} disabled={!newSyllabus.title || !newSyllabus.subject}>Create syllabus manually</button>
                 </div>
               </div>
             )}
+
 
             {syllabuses.length === 0 && !showNewSyllabus ? (
               <div className={styles.emptyState}>

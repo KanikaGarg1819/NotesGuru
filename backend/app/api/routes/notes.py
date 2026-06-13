@@ -57,7 +57,6 @@ async def process_note(
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
 
-    # Get chapters from DB if syllabus exists
     chapters = []
     syllabus = db.query(Syllabus).filter(
         Syllabus.id == syllabus_id,
@@ -68,7 +67,6 @@ async def process_note(
         db_chapters = db.query(Chapter).filter(Chapter.syllabus_id == syllabus_id).all()
         chapters = [{"id": c.id, "title": c.title, "description": c.description or ""} for c in db_chapters]
 
-    # Fallback dummy chapters if no syllabus
     if not chapters:
         chapters = [
             {"id": 1, "title": "General Notes", "description": ""},
@@ -85,12 +83,12 @@ async def process_note(
         subject=subject,
     )
 
-    # Save note record with pending status
+    actual_syllabus_id = syllabus_id if syllabus else None
     note = Note(
         image_url=f"task:{task.id}",
         status=NoteStatus.PENDING,
         owner_id=current_user.id,
-        syllabus_id=syllabus_id,
+        syllabus_id=actual_syllabus_id,
     )
     db.add(note)
     db.commit()
@@ -126,8 +124,6 @@ async def get_task_status(
 
     if task.state == "SUCCESS":
         result = task.result
-
-        # Save guide to DB if successful
         if result.get("success"):
             note = db.query(Note).filter(Note.image_url == f"task:{task_id}").first()
             if note:
@@ -137,8 +133,6 @@ async def get_task_status(
                 note.status = NoteStatus.MATCHED if result.get("matched") else NoteStatus.UNMATCHED
                 note.chapter_id = result.get("chapter_id")
                 db.flush()
-
-                # Save guide if not already saved
                 existing = db.query(Guide).filter(Guide.note_id == note.id).first()
                 if not existing and result.get("guide_content"):
                     guide = Guide(
@@ -149,9 +143,7 @@ async def get_task_status(
                         note_id=note.id,
                     )
                     db.add(guide)
-
                 db.commit()
-
         return {"task_id": task_id, "status": "done", "result": result}
 
     if task.state == "FAILURE":
